@@ -3,6 +3,9 @@ import re
 import time
 from pathlib import Path
 from typing import List, Optional
+import motor.motor_asyncio
+import asyncio
+import functools
 
 from instagrapi.exceptions import ClientNotFoundError, DirectThreadNotFound
 from instagrapi.extractors import (
@@ -18,6 +21,7 @@ from instagrapi.types import (
     DirectThread,
 )
 from instagrapi.utils import dumps
+from responses import upsert
 
 SELECTED_FILTERS = ("flagged", "unread")
 
@@ -33,8 +37,12 @@ class DirectMixin:
     """
     Helpers for managing Direct Messaging
     """
+    mongo_client = None
 
-    def direct_threads(self, amount: int = 20, selected_filter: SELECTED_FILTER = "",
+    def set_mongo_client(self, mongo_client):
+        self.mongo_client = mongo_client
+
+    async def direct_threads(self, amount: int = 20, selected_filter: SELECTED_FILTER = "",
                        thread_message_limit: Optional[int] = None) -> List[DirectThread]:
         """
         Get direct message threads
@@ -63,7 +71,7 @@ class DirectMixin:
                 "selected_filter": selected_filter,
                 "fetch_reason": "manual_refresh",
             })
-        if thread_message_limit:
+        if thread_message_limit is not None:
             params.update({
                 "thread_message_limit": thread_message_limit
             })
@@ -73,7 +81,8 @@ class DirectMixin:
         while True:
             if cursor:
                 params["cursor"] = cursor
-            result = self.private_request("direct_v2/inbox/", params=params)
+            loop = asyncio.get_event_loop()
+            result =  await loop.run_in_executor(None, functools.partial(self.private_request, "direct_v2/inbox/", params=params))
             inbox = result.get("inbox", {})
             for thread in inbox.get("threads", []):
                 threads.append(extract_direct_thread(thread))
@@ -84,7 +93,7 @@ class DirectMixin:
             threads = threads[:amount]
         return threads
 
-    def direct_pending_inbox(self, amount: int = 20) -> List[DirectThread]:
+    async def direct_pending_inbox(self, amount: int = 20) -> List[DirectThread]:
         """
         Get direct message pending threads
 
@@ -109,7 +118,8 @@ class DirectMixin:
         while True:
             if cursor:
                 params["cursor"] = cursor
-            result = self.private_request("direct_v2/pending_inbox/", params=params)
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, functools.partial(self.private_request, "direct_v2/pending_inbox/", params=params))
             inbox = result.get("inbox", {})
             for thread in inbox.get("threads", []):
                 threads.append(extract_direct_thread(thread))
@@ -120,7 +130,7 @@ class DirectMixin:
             threads = threads[:amount]
         return threads
 
-    def direct_thread(self, thread_id: int, amount: int = 20) -> DirectThread:
+    async def direct_thread(self, thread_id: int, amount: int = 10, cursor = None) -> DirectThread:
         """
         Get all the information about a Direct Message thread
 
@@ -142,17 +152,15 @@ class DirectMixin:
             "visual_message_return_type": "unseen",
             "direction": "older",
             "seq_id": "40065",  # 59663
-            "limit": "20",
+            "limit": "10",
         }
-        cursor = None
         items = []
         while True:
             if cursor:
                 params["cursor"] = cursor
             try:
-                result = self.private_request(
-                    f"direct_v2/threads/{thread_id}/", params=params
-                )
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(None , functools.partial(self.private_request, f"direct_v2/threads/{thread_id}/", params=params))
             except ClientNotFoundError as e:
                 raise DirectThreadNotFound(e, thread_id=thread_id, **self.last_json)
             thread = result["thread"]
@@ -166,7 +174,38 @@ class DirectMixin:
         thread["items"] = items
         return extract_direct_thread(thread)
 
-    def direct_messages(self, thread_id: int, amount: int = 20) -> List[DirectMessage]:
+    async def get_unseen_messages(self):
+        result = list()
+        threads =  await self.direct_threads(amount=100, selected_filter="unread", thread_message_limit=1)
+        pending_threads =  await self.direct_pending_inbox(amount=100)
+        threads = threads + pending_threads
+        for thread in threads:
+            new_seen_message_id = thread.messages[0].id
+            if thread_info := await self.mongo_client.instagram_db.thread_info.find_one({"_id": thread.id}):
+                messages =  await self.extract_unseen_messages(thread, thread_info)
+                result.append({"thread_name": thread.thread_title,"thread_id": thread.id, "thread_type": thread.thread_type, "is_pending": thread.pending, "messages": messages})
+            await self.mongo_client.instagram_db.thread_info.update_one({"_id": thread.id},  {"$set": {"last_seen_message_id": new_seen_message_id, "is_pending": thread.pending}}, upsert=True)
+        return result
+
+
+    async def extract_unseen_messages(self, thread: DirectThread, thread_info: {}):
+        messages = list()
+        last_seen_messsage_id = thread_info["last_seen_message_id"]
+        current_message = thread.messages[0]
+        thread.cursor = None
+        while current_message.id != last_seen_messsage_id:
+            thread = await self.direct_thread(thread.id, amount=10, cursor=thread.cursor)
+            for message in thread.messages:
+                current_message = message
+                if current_message.id == last_seen_messsage_id:
+                    break
+                if not current_message.is_sent_by_viewer:
+                    messages.append(current_message)
+                messages.reverse()
+        return messages
+
+                    
+    async def direct_messages(self, thread_id: int, amount: int = 20) -> List[DirectMessage]:
         """
         Get all the messages from a thread
 
@@ -184,9 +223,9 @@ class DirectMixin:
             A list of objects of DirectMessage
         """
         assert self.user_id, "Login required"
-        return self.direct_thread(thread_id, amount).messages
+        return  await self.direct_thread(thread_id, amount).messages
 
-    def direct_answer(self, thread_id: int, text: str) -> DirectMessage:
+    async def direct_answer(self, thread_id: int, text: str) -> DirectMessage:
         """
         Post a message on a Direct Message thread
 
@@ -204,9 +243,9 @@ class DirectMixin:
             An object of DirectMessage
         """
         assert self.user_id, "Login required"
-        return self.direct_send(text, [], [int(thread_id)])
+        return  await self.direct_send(text, [], [int(thread_id)])
 
-    def direct_send(self, text: str, user_ids: List[int] = [], thread_ids: List[int] = []) -> DirectMessage:
+    async def direct_send(self, text: str, user_ids: List[int] = [], thread_ids: List[int] = []) -> DirectMessage:
         """
         Send a direct message to list of users or threads
 
@@ -249,11 +288,8 @@ class DirectMixin:
             kwargs["thread_ids"] = dumps([int(tid) for tid in thread_ids])
         if user_ids:
             kwargs["recipient_users"] = dumps([[int(uid) for uid in user_ids]])
-        result = self.private_request(
-            f"direct_v2/threads/broadcast/{method}/",
-            data=self.with_default_data(kwargs),
-            with_signature=False
-        )
+        loop = asyncio.get_event_loop()
+        result =  await loop.run_in_executor(None, functools.partial(self.private_request, f"direct_v2/threads/broadcast/{method}/", data=self.with_default_data(kwargs), with_signature=False))
         return extract_direct_message(result["payload"])
 
     def direct_send_photo(self, path: Path, user_ids: List[int] = [], thread_ids: List[int] = []) -> DirectMessage:
@@ -274,7 +310,7 @@ class DirectMixin:
         DirectMessage
             An object of DirectMessage
         """
-        return self.direct_send_file(path, user_ids, thread_ids, content_type='photo')
+        return  self.direct_send_file(path, user_ids, thread_ids, content_type='photo')
 
     def direct_send_video(self, path: Path, user_ids: List[int] = [], thread_ids: List[int] = []) -> DirectMessage:
         """
@@ -294,7 +330,7 @@ class DirectMixin:
         DirectMessage
             An object of DirectMessage
         """
-        return self.direct_send_file(path, user_ids, thread_ids, content_type='video')
+        return  self.direct_send_file(path, user_ids, thread_ids, content_type='video')
 
     def direct_send_file(self, path: Path, user_ids: List[int] = [], thread_ids: List[int] = [], content_type: str = 'photo') -> DirectMessage:
         """
@@ -347,7 +383,7 @@ class DirectMixin:
         upload_id, width, height = getattr(self, f'{content_type}_rupload')(path, upload_id, **kwargs)[:3]
         data['upload_id'] = upload_id
         # data['content_type'] = content_type
-        result = self.private_request(
+        result =  self.private_request(
             f"direct_v2/threads/broadcast/{method}/",
             data=self.with_default_data(data),
             with_signature=False,
@@ -369,8 +405,8 @@ class DirectMixin:
         """
         data = {}
 
-        thread = self.direct_thread(thread_id=thread_id)
-        result = self.private_request(
+        thread =  self.direct_thread(thread_id=thread_id)
+        result =  self.private_request(
             f"direct_v2/threads/{thread_id}/items/{thread.messages[0].id}/seen/",
             data=self.with_default_data(data),
             with_signature=False,
@@ -391,7 +427,7 @@ class DirectMixin:
         List[DirectShortThread]
             List of short version of DirectThread
         """
-        result = self.private_request(
+        result =  self.private_request(
             "direct_v2/ranked_recipients/",
             params={"mode": "raven", "show_threads": "true", "query": str(query)}
         )
@@ -416,7 +452,7 @@ class DirectMixin:
             An object of DirectThread
         """
         recipient_users = dumps([int(uid) for uid in user_ids])
-        result = self.private_request(
+        result =  self.private_request(
             "direct_v2/threads/get_by_participants/",
             params={"recipient_users": recipient_users, "seq_id": 2580572, "limit": 20}
         )
@@ -446,7 +482,7 @@ class DirectMixin:
         data = self.with_default_data({})
         data.pop('_uid', None)
         data.pop('device_id', None)
-        result = self.private_request(
+        result =  self.private_request(
             f"direct_v2/threads/{thread_id}/hide/",
             data=data
         )
@@ -483,7 +519,7 @@ class DirectMixin:
             'nav_chain': '1VL:feed_timeline:1,1VL:feed_timeline:2,1VL:feed_timeline:5,DirectShareSheetFragment:direct_reshare_sheet:6',
             'offline_threading_id': token,
         }
-        result = self.private_request(
+        result =  self.private_request(
             "direct_v2/threads/broadcast/media_share/",
             # params={'media_type': 'video'},
             data=self.with_default_data(data),
@@ -530,7 +566,7 @@ class DirectMixin:
             data["recipient_users"] = dumps([[int(uid) for uid in user_ids]])
         if thread_ids:
             data["thread_ids"] = dumps([int(tid) for tid in thread_ids])
-        result = self.private_request(
+        result =  self.private_request(
             "direct_v2/threads/broadcast/story_share/",
             # params={'story_type': 'video'},
             data=self.with_default_data(data),
@@ -555,7 +591,7 @@ class DirectMixin:
         data = self.with_default_data({})
         data.pop('_uid', None)
         data.pop('device_id', None)
-        result = self.private_request(
+        result =  self.private_request(
             f"direct_v2/threads/{thread_id}/mark_unread/",
             data=data
         )
@@ -583,7 +619,7 @@ class DirectMixin:
         data['is_shh_mode'] = 0
         data['send_attribution'] = 'direct_thread'
         data['original_message_client_context'] = self.generate_mutation_token()
-        result = self.private_request(
+        result =  self.private_request(
             f"direct_v2/threads/{thread_id}/items/{message_id}/delete/",
             data=data
         )
@@ -606,7 +642,7 @@ class DirectMixin:
             A boolean value
         """
         name = "unmute" if revert else "mute"
-        result = self.private_request(
+        result =  self.private_request(
             f"direct_v2/threads/{thread_id}/{name}/",
             data={'_uuid': self.uuid}
         )
@@ -626,7 +662,7 @@ class DirectMixin:
         bool
             A boolean value
         """
-        return self.direct_thread_mute(thread_id, revert=True)
+        return  self.direct_thread_mute(thread_id, revert=True)
 
     def direct_thread_mute_video_call(self, thread_id: int, revert: bool = False) -> bool:
         """
@@ -645,7 +681,7 @@ class DirectMixin:
             A boolean value
         """
         name = "unmute_video_call" if revert else "mute_video_call"
-        result = self.private_request(
+        result =  self.private_request(
             f"direct_v2/threads/{thread_id}/{name}/",
             data={'_uuid': self.uuid}
         )
@@ -665,4 +701,4 @@ class DirectMixin:
         bool
             A boolean value
         """
-        return self.direct_thread_mute_video_call(thread_id, revert=True)
+        return  self.direct_thread_mute_video_call(thread_id, revert=True)
