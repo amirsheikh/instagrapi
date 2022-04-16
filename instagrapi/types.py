@@ -327,6 +327,7 @@ class DirectThread(BaseModel):
     assigned_admin_id: int
     shh_mode_enabled: bool
     last_seen_at: dict
+    cursor: str = None
 
     def is_seen(self, user_id: str):
         """Have I seen this thread?
