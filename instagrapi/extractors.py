@@ -240,6 +240,7 @@ def extract_direct_thread(data):
     if "inviter" in data:
         data["inviter"] = extract_user_short(data["inviter"])
     data["left_users"] = data.get("left_users", [])
+    data["cursor"] = data.get("oldest_cursor")
     return DirectThread(**data)
 
 
