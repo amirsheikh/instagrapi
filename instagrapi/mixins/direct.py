@@ -21,7 +21,8 @@ from instagrapi.types import (
     DirectThread,
 )
 from instagrapi.utils import dumps
-from responses import upsert
+
+
 
 SELECTED_FILTERS = ("flagged", "unread")
 
