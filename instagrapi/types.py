@@ -279,6 +279,7 @@ class DirectMessage(BaseModel):
     felix_share: Optional[dict]
     clip: Optional[Media]
     placeholder: Optional[dict]
+    is_sent_by_viewer: bool = True
 
 
 class DirectResponse(BaseModel):
