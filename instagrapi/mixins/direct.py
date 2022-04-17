@@ -200,11 +200,9 @@ class DirectMixin:
                 current_message = message
                 if current_message.id == last_seen_messsage_id:
                     break
-                if not current_message.is_sent_by_viewer:
-                    messages.append(current_message)
-                messages.reverse()
+                messages.append(current_message)
+            messages.reverse()
         return messages
-
                     
     async def direct_messages(self, thread_id: int, amount: int = 20) -> List[DirectMessage]:
         """
