@@ -182,10 +182,10 @@ class DirectMixin:
         threads = threads + pending_threads
         for thread in threads:
             new_seen_message_id = thread.messages[0].id
-            if thread_info := await self.mongo_client.instagram_db.thread_info.find_one({"_id": {"id": thread.id, "username": self.username}}):
+            if thread_info := await self.mongo_client.instagram_db.thread_info.find_one({"_id": {"insta_id": thread.id, "username": self.username}}):
                 messages =  await self.extract_unseen_messages(thread, thread_info)
                 result.append({"thread_name": thread.thread_title,"thread_id": thread.id, "thread_type": thread.thread_type, "is_pending": thread.pending, "messages": messages})
-            await self.mongo_client.instagram_db.thread_info.update_one({"_id": {"id": thread.id, "username": self.username}},  {"$set": {"last_seen_message_id": new_seen_message_id, "is_pending": thread.pending}}, upsert=True)
+            await self.mongo_client.instagram_db.thread_info.update_one({"_id": {"insta_id": thread.id, "username": self.username}},  {"$set": {"last_seen_message_id": new_seen_message_id, "is_pending": thread.pending}}, upsert=True)
         return result
 
 
